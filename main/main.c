@@ -13,13 +13,95 @@
 #include "esp_event_loop.h"
 #include "nvs_flash.h"
 
+#include "lwip/sockets.h"
+#include "lwip/dns.h"
+#include "lwip/netdb.h"
+
 #include "esp_log.h"
+#include "mqtt_client.h"
 
 //Define this variable to be used in logging macros eg ESP_LOGI(tag, format, ...)
 static const char *TAG = "IOT_BOARD";
 
 static EventGroupHandle_t wifi_event_group;
 const static int CONNECTED_BIT = BIT0;
+
+// Define max string length for messages
+// FIXME is this the right data type? also note that name of device takes away
+// from number of available characters
+const static uint8_t MAX_MSG_LEN = 140;
+
+// Add device name to message string
+static void add_name_to_message(char *msg_dest, const char *msg)
+{
+  if((strlen(msg)+strlen(CONFIG_DEVICE_NAME)+5) > MAX_MSG_LEN){
+    ESP_LOGE(TAG, "Message to be published too long. Aborting...");
+    abort();
+  } else {
+    char data[(strlen(msg)+strlen(CONFIG_DEVICE_NAME)+5)];  // 5 chosen to allow for additional characters in message
+    sprintf(data, "%s => %s", CONFIG_DEVICE_NAME, msg);
+    strlcpy(msg_dest, data, sizeof(data));
+  }
+}
+
+static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
+{
+  esp_mqtt_client_handle_t client = event->client;
+  int msg_id;
+  char data[MAX_MSG_LEN];
+
+  switch (event->event_id) {
+    case MQTT_EVENT_CONNECTED:
+      ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+      add_name_to_message(data, "Online");
+      msg_id = esp_mqtt_client_publish(client, "/monitor/status", data, 0, 2, 1);
+      ESP_LOGI(TAG, "send publish successful, msg_id=%d", msg_id);
+      break;
+    case MQTT_EVENT_DISCONNECTED:
+      ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+      break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+      ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+      break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+      ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+      break;
+    case MQTT_EVENT_PUBLISHED:
+      ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+      break;
+    case MQTT_EVENT_DATA:
+      ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+      printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+      printf("DATA=%.*s\r\n", event->data_len, event->data);
+      break;
+    case MQTT_EVENT_ERROR:
+      ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+      break;
+    default:
+      ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+      break;
+  }
+  return ESP_OK;
+}
+
+
+static void mqtt_start(void)
+{
+  char lwt_data[MAX_MSG_LEN];
+  add_name_to_message(lwt_data, "Offline");
+  esp_mqtt_client_config_t mqtt_cfg = {
+    .uri = CONFIG_BROKER_URL,
+    .event_handle = mqtt_event_handler,
+    .lwt_topic = "/monitor/status",
+    .lwt_msg = lwt_data,
+    .lwt_qos = 2,
+    .lwt_retain = 1,
+  };
+
+  esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+  esp_mqtt_client_start(client);
+}
 
 static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 {
@@ -69,7 +151,14 @@ void app_main(void)
   ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
 
   esp_log_level_set("*", ESP_LOG_INFO);
+  esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
+  esp_log_level_set("TRANSPORT_TCP", ESP_LOG_VERBOSE);
+  esp_log_level_set("TRANSPORT_SSL", ESP_LOG_VERBOSE);
+  esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
+  esp_log_level_set("OUTBOX", ESP_LOG_VERBOSE);
 
   nvs_flash_init();
   wifi_init();
+
+  mqtt_start();
 }
