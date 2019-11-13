@@ -19,6 +19,9 @@
 
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "driver/gpio.h"
+
+#define LED_GPIO_OUTPUT_IO_0 23
 
 //Define this variable to be used in logging macros eg ESP_LOGI(tag, format, ...)
 static const char *TAG = "IOT_BOARD";
@@ -31,8 +34,40 @@ const static int CONNECTED_BIT = BIT0;
 // from number of available characters
 const static uint8_t MAX_MSG_LEN = 140;
 
+// Configure LED pin
+static void led_init(void)
+{
+  // Configure the IOMUX register for pad LED_GPIO_OUTPUT_IO_0
+  gpio_pad_select_gpio(LED_GPIO_OUTPUT_IO_0);
+  // Set the GPIO as a push/pull output
+  gpio_set_direction(LED_GPIO_OUTPUT_IO_0, GPIO_MODE_OUTPUT);
+  // Start with the LED off
+  gpio_set_level(LED_GPIO_OUTPUT_IO_0, 0);
+}
+
+// Process message
+static void process_message(char *topic, size_t topic_len, char *msg, size_t msg_len)
+{
+  printf("topic: %s, msg: %s\n", topic, msg);
+  if (strncasecmp(topic, "/board/led", topic_len) == 0)
+  {
+    if (strncasecmp(msg, "on", msg_len) == 0)
+    {
+        gpio_set_level(LED_GPIO_OUTPUT_IO_0, 1);
+        ESP_LOGI(TAG, "Turning LED on.");
+    } else if (strncasecmp(msg, "off", msg_len) == 0) {
+        gpio_set_level(LED_GPIO_OUTPUT_IO_0, 0);
+        ESP_LOGI(TAG, "Turning LED off");
+    } else {
+        ESP_LOGI(TAG, "Unable to match message");
+    }
+  } else {
+    ESP_LOGI(TAG, "Unable to match topic");
+  }
+}
+
 // Add device name to message string
-static void add_name_to_message(char *msg_dest, const char *msg)
+static void add_device_name_to_msg(char *msg_dest, const char *msg)
 {
   if((strlen(msg)+strlen(CONFIG_DEVICE_NAME)+5) > MAX_MSG_LEN){
     ESP_LOGE(TAG, "Message to be published too long. Aborting...");
@@ -53,9 +88,12 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
   switch (event->event_id) {
     case MQTT_EVENT_CONNECTED:
       ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-      add_name_to_message(data, "Online");
+      add_device_name_to_msg(data, "Online");
       msg_id = esp_mqtt_client_publish(client, "/monitor/status", data, 0, 2, 1);
-      ESP_LOGI(TAG, "send publish successful, msg_id=%d", msg_id);
+      ESP_LOGI(TAG, "Publish to /monitor/status successful, msg_id=%d", msg_id);
+
+      msg_id = esp_mqtt_client_subscribe(client, "/board/led", 1);
+      ESP_LOGI(TAG, "Subscribe to /board/led successful, msg_id=%d", msg_id);
       break;
     case MQTT_EVENT_DISCONNECTED:
       ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -74,6 +112,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
       ESP_LOGI(TAG, "MQTT_EVENT_DATA");
       printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
       printf("DATA=%.*s\r\n", event->data_len, event->data);
+      process_message(event->topic, event->topic_len, event->data, event->data_len);
       break;
     case MQTT_EVENT_ERROR:
       ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -89,7 +128,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 static void mqtt_start(void)
 {
   char lwt_data[MAX_MSG_LEN];
-  add_name_to_message(lwt_data, "Offline");
+  add_device_name_to_msg(lwt_data, "Offline");
   esp_mqtt_client_config_t mqtt_cfg = {
     .uri = CONFIG_BROKER_URL,
     .event_handle = mqtt_event_handler,
@@ -159,6 +198,8 @@ void app_main(void)
 
   nvs_flash_init();
   wifi_init();
+
+  led_init();
 
   mqtt_start();
 }
