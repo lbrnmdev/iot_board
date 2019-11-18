@@ -22,12 +22,21 @@
 #include "driver/gpio.h"
 
 #define LED_GPIO_OUTPUT_IO_0 23
+#define BUTTON_GPIO_INPUT_IO_0 4
+#define GPIO_INPUT_PIN_SEL ((1ULL<<BUTTON_GPIO_INPUT_IO_0)) // create bit mask of pin
+#define ESP_INTR_FLAG_DEFAULT 0
 
 //Define this variable to be used in logging macros eg ESP_LOGI(tag, format, ...)
 static const char *TAG = "IOT_BOARD";
 
 static EventGroupHandle_t wifi_event_group;
 const static int CONNECTED_BIT = BIT0;
+
+// global mqtt client
+esp_mqtt_client_handle_t global_mqtt_client;
+
+// Queue for gpio events
+static xQueueHandle gpio_evt_queue = NULL;
 
 // Define max string length for messages
 // FIXME is this the right data type? also note that name of device takes away
@@ -48,7 +57,7 @@ static void led_init(void)
 // Process message
 static void process_message(char *topic, size_t topic_len, char *msg, size_t msg_len)
 {
-  printf("topic: %s, msg: %s\n", topic, msg);
+  printf("topic: %.*s, msg: %.*s\n", topic_len, topic, msg_len, msg);
   if (strncasecmp(topic, "/board/led", topic_len) == 0)
   {
     if (strncasecmp(msg, "on", msg_len) == 0)
@@ -138,8 +147,8 @@ static void mqtt_start(void)
     .lwt_retain = 1,
   };
 
-  esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-  esp_mqtt_client_start(client);
+  global_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+  esp_mqtt_client_start(global_mqtt_client);
 }
 
 static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
@@ -183,6 +192,60 @@ static void wifi_init(void)
   xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
 }
 
+static void IRAM_ATTR gpio_isr_handler(void* arg)
+{
+  uint32_t gpio_num = (uint32_t) arg;
+  xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+static void button_to_mqtt_task(void* arg)
+{
+  // FIXME declaring + initializing too many variables
+  uint32_t io_num, button_level;
+  int msg_id;
+  char data[MAX_MSG_LEN];
+  for(;;) {
+    if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+      button_level = gpio_get_level(io_num);
+      ESP_LOGI(TAG, "GPIO[%d] intr, val: [%d]", io_num, button_level);
+      add_device_name_to_msg(data, "Button press"); // TODO modify to include which button
+      msg_id = esp_mqtt_client_publish(global_mqtt_client, "/board/button", data, 0, 1, 0);
+      ESP_LOGI(TAG, "Publish to /board/button successful, msg_id=%d", msg_id);
+    }
+  }
+}
+
+static void button_init(void)
+{
+  // config struct
+  gpio_config_t io_conf;
+  // interrupt of falling edge
+  io_conf.intr_type = GPIO_INTR_NEGEDGE;
+  // set bit mask of the pins
+  io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+  // set to input mode
+  io_conf.mode = GPIO_MODE_INPUT;
+  // disable pull-down mode
+  io_conf.pull_down_en = 0;
+  // enable pull-up mode
+  io_conf.pull_up_en = 1;
+  // configure gpio
+  gpio_config(&io_conf);
+}
+
+static void isr_init(void)
+{
+  // create a queue for gpio events
+  gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+  // start gpio task
+  xTaskCreate(button_to_mqtt_task, "button_to_mqtt_task", 2048, NULL, 10, NULL);
+
+  // install gpio isr service
+  gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+  // hook isr handler for specific gpio pin
+  gpio_isr_handler_add(BUTTON_GPIO_INPUT_IO_0, gpio_isr_handler, (void*) BUTTON_GPIO_INPUT_IO_0);
+}
+
 void app_main(void)
 {
   ESP_LOGI(TAG, "[APP] Startup..");
@@ -200,6 +263,9 @@ void app_main(void)
   wifi_init();
 
   led_init();
+
+  button_init();
+  isr_init();
 
   mqtt_start();
 }
