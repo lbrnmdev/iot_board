@@ -3,6 +3,9 @@
 #include <stddef.h>
 #include <string.h>
 
+#include <time.h>
+#include <sys/time.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -21,16 +24,35 @@
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 
-#define LED_GPIO_OUTPUT_IO_0 23
+// adc includes
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+
+// sleep & rtc includes
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/rtc.h"
+
+#define LED_GPIO_OUTPUT_IO_0 23       // GPIO 23 for led output
 #define BUTTON_GPIO_INPUT_IO_0 4
 #define GPIO_INPUT_PIN_SEL ((1ULL<<BUTTON_GPIO_INPUT_IO_0)) // create bit mask of pin
 #define ESP_INTR_FLAG_DEFAULT 0
+
+// adc defines
+#define DEFAULT_VREF          1100    // Use adc2_vref_to_gpio() to obtain a better estimate
+#define NO_OF_SAMPLES         64      // for multisampling
 
 //Define this variable to be used in logging macros eg ESP_LOGI(tag, format, ...)
 static const char *TAG = "IOT_BOARD";
 
 static EventGroupHandle_t wifi_event_group;
 const static int CONNECTED_BIT = BIT0;
+
+static EventGroupHandle_t mqtt_event_group;
+const static int MQTT_HEALTH_BIT = BIT0;
+
+static RTC_DATA_ATTR struct timeval sleep_enter_time;
 
 // global mqtt client
 esp_mqtt_client_handle_t global_mqtt_client;
@@ -43,6 +65,79 @@ static xQueueHandle gpio_evt_queue = NULL;
 // from number of available characters
 const static uint8_t MAX_MSG_LEN = 140;
 
+// adc variables
+static esp_adc_cal_characteristics_t *adc_chars;
+static const adc_channel_t channel_tmp36 = ADC_CHANNEL_7;     // GPIO35 if ADC1, GPIO14 if ADC2
+static const adc_atten_t atten = ADC_ATTEN_DB_0;              // attenuation of 0dB giving full-scale voltage of 1.1V
+static const adc_unit_t unit = ADC_UNIT_1;                    // use ADC1
+
+// temp value
+static char tmp36_temp_str[140];
+
+// determine supported calibration values
+static void check_efuse()
+{
+  // check TP is burned into eFuse
+  if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK) {
+    ESP_LOGI(TAG, "eFuse Two Point: Supported\n");
+  } else {
+    ESP_LOGI(TAG, "eFuse Two Point: NOT supported\n");
+  }
+
+  // check Vref is burned into eFuse
+  if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_VREF) == ESP_OK) {
+    ESP_LOGI(TAG, "eFuse Vref: Supported\n");
+  } else {
+    ESP_LOGI(TAG, "eFuse Vref: NOT supported\n");
+  }
+}
+
+// log type of characterization used
+static void print_char_val_type(esp_adc_cal_value_t val_type)
+{
+  if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
+    ESP_LOGI(TAG, "Characterized using Two Point Value\n");
+  } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+    ESP_LOGI(TAG, "Characterized using eFuse Vref\n");
+  } else {
+    ESP_LOGI(TAG, "Characterized using Default Vref\n");
+  }
+}
+
+static void config_adc()
+{
+  // config adc width and channel attenuation
+  if (unit == ADC_UNIT_1) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(channel_tmp36, atten);
+  } else {
+    adc2_config_channel_atten((adc2_channel_t)channel_tmp36, atten);
+  }
+
+  // characterize adc
+  adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
+  esp_adc_cal_value_t val_type = esp_adc_cal_characterize(unit, atten, ADC_WIDTH_BIT_12, DEFAULT_VREF, adc_chars);
+  print_char_val_type(val_type);
+}
+
+// obtain raw adc reading
+static uint32_t read_adc()
+{
+  uint32_t reading = 0;
+  // multisample
+  for (int i = 0; i < NO_OF_SAMPLES; i++) {
+    if (unit == ADC_UNIT_1) {
+      reading += adc1_get_raw((adc1_channel_t)channel_tmp36);
+    } else {
+      int raw;
+      adc2_get_raw((adc2_channel_t)channel_tmp36, ADC_WIDTH_BIT_12, &raw);
+      reading += raw;
+    }
+  }
+  reading /= NO_OF_SAMPLES;
+  return reading;
+}
+
 // Configure LED pin
 static void led_init(void)
 {
@@ -50,8 +145,8 @@ static void led_init(void)
   gpio_pad_select_gpio(LED_GPIO_OUTPUT_IO_0);
   // Set the GPIO as a push/pull output
   gpio_set_direction(LED_GPIO_OUTPUT_IO_0, GPIO_MODE_OUTPUT);
-  // Start with the LED off
-  gpio_set_level(LED_GPIO_OUTPUT_IO_0, 0);
+  // Start with the LED on
+  gpio_set_level(LED_GPIO_OUTPUT_IO_0, 1);
 }
 
 // Process message
@@ -103,9 +198,14 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 
       msg_id = esp_mqtt_client_subscribe(client, "/board/led", 1);
       ESP_LOGI(TAG, "Subscribe to /board/led successful, msg_id=%d", msg_id);
+
+      msg_id = esp_mqtt_client_publish(global_mqtt_client, "/board/button", tmp36_temp_str, 0, 1, 0);
+      ESP_LOGI(TAG, "Publish to /board/button successful, msg_id=%d, temp in celsius", msg_id);
+      xEventGroupSetBits(mqtt_event_group, MQTT_HEALTH_BIT);
       break;
     case MQTT_EVENT_DISCONNECTED:
       ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+      xEventGroupClearBits(mqtt_event_group, MQTT_HEALTH_BIT);
       break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -147,8 +247,21 @@ static void mqtt_start(void)
     .lwt_retain = 1,
   };
 
+  mqtt_event_group = xEventGroupCreate();
+
   global_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
   esp_mqtt_client_start(global_mqtt_client);
+
+  EventBits_t uxBitsToWaitFor;
+  const TickType_t xTicksToWaitFor = 60000 / portTICK_PERIOD_MS; // 60 sec timeout
+  uxBitsToWaitFor = xEventGroupWaitBits(mqtt_event_group, MQTT_HEALTH_BIT, false, true, xTicksToWaitFor);
+  if ( ( uxBitsToWaitFor & MQTT_HEALTH_BIT ) != 0 )
+  {
+    printf("MQTT health success\n");    // successful
+  }
+  else {
+    printf("MQTT health fail, timeout\n");   // timeout
+  }
 }
 
 static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
@@ -170,7 +283,11 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
   return ESP_OK;
 }
 
-static void wifi_init(void)
+/**
+* TODO: Have this version of wifi_init return EventBits_t which can be tested to
+* if the connection attempt has been successful or not. Or return boolean?
+*/
+static bool wifi_init(void)
 {
   tcpip_adapter_init();
   wifi_event_group = xEventGroupCreate();
@@ -189,7 +306,18 @@ static void wifi_init(void)
   ESP_LOGI(TAG, "start the WIFI SSID:[%s]", CONFIG_WIFI_SSID);
   ESP_ERROR_CHECK(esp_wifi_start());
   ESP_LOGI(TAG, "Waiting for wifi");
-  xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
+
+  EventBits_t uxBits;
+  const TickType_t xTicksToWait = 30000 / portTICK_PERIOD_MS; // 30 sec timeout
+  uxBits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, xTicksToWait);
+
+  if ( ( uxBits & CONNECTED_BIT ) != 0 )
+  {
+    return true;    // successful connection
+  }
+  else {
+    return false;   // timeout
+  }
 }
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
@@ -260,12 +388,49 @@ void app_main(void)
   esp_log_level_set("OUTBOX", ESP_LOG_VERBOSE);
 
   nvs_flash_init();
-  wifi_init();
 
   led_init();
-
   button_init();
-  isr_init();
 
-  mqtt_start();
+  // take temp reading
+  check_efuse();
+  config_adc();
+  uint32_t tmp36_reading = read_adc();
+  printf("raw adc in app_main(): %d\n", tmp36_reading);
+  uint32_t tmp36_voltage = esp_adc_cal_raw_to_voltage(tmp36_reading, adc_chars);
+  printf("raw voltage in app_main(): %dmV\n", tmp36_voltage);
+  uint32_t tmp36_temp = (tmp36_voltage - 500)/10;
+  printf("raw temp in app_main(): %d celsius\n", tmp36_temp);
+  sprintf(tmp36_temp_str, "temp => %d", tmp36_temp);
+
+  if( wifi_init() )
+  {
+    isr_init();
+    mqtt_start();
+    esp_mqtt_client_stop(global_mqtt_client);
+  } else
+  {
+    printf("Unable to connect to WiFi\n");
+  }
+
+  ESP_ERROR_CHECK(esp_wifi_stop());
+  ESP_LOGI(TAG, "Stopping wifi");
+
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  int sleep_time_ms = (now.tv_sec - sleep_enter_time.tv_sec) * 1000 + (now.tv_usec - sleep_enter_time.tv_usec) / 1000;
+
+  switch (esp_sleep_get_wakeup_cause()) {
+    case ESP_SLEEP_WAKEUP_TIMER: {
+      ESP_LOGI(TAG, "Wake up from timer. Time spent in deep sleep: %dms\n", sleep_time_ms);
+      break;
+    }
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    default:
+      ESP_LOGI(TAG, "Not a deep sleep reset\n");
+  }
+
+  printf("Entering deep sleep\n");
+  gettimeofday(&sleep_enter_time, NULL);
+  esp_deep_sleep(60000000);   // deep sleep for 60 seconds
 }
