@@ -145,7 +145,7 @@ static void led_init(void)
   gpio_pad_select_gpio(LED_GPIO_OUTPUT_IO_0);
   // Set the GPIO as a push/pull output
   gpio_set_direction(LED_GPIO_OUTPUT_IO_0, GPIO_MODE_OUTPUT);
-  // Start with the LED on
+  // Start with the LED on. This way user knows when device is awake
   gpio_set_level(LED_GPIO_OUTPUT_IO_0, 1);
 }
 
@@ -153,6 +153,8 @@ static void led_init(void)
 static void process_message(char *topic, size_t topic_len, char *msg, size_t msg_len)
 {
   printf("topic: %.*s, msg: %.*s\n", topic_len, topic, msg_len, msg);
+  // TODO: Currently no real point in toggling LED via mqtt.
+  // TODO: Handle case where topic is /board/sleep/time.
   if (strncasecmp(topic, "/board/led", topic_len) == 0)
   {
     if (strncasecmp(msg, "on", msg_len) == 0)
@@ -185,6 +187,8 @@ static void add_device_name_to_msg(char *msg_dest, const char *msg)
 
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
+  // TODO: Include timestamp in all published data
+
   esp_mqtt_client_handle_t client = event->client;
   int msg_id;
   char data[MAX_MSG_LEN];
@@ -192,15 +196,16 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
   switch (event->event_id) {
     case MQTT_EVENT_CONNECTED:
       ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-      add_device_name_to_msg(data, "Online");
+      add_device_name_to_msg(data, "Online"); // TODO: wakeup source data
       msg_id = esp_mqtt_client_publish(client, "/monitor/status", data, 0, 2, 1);
       ESP_LOGI(TAG, "Publish to /monitor/status successful, msg_id=%d", msg_id);
 
       msg_id = esp_mqtt_client_subscribe(client, "/board/led", 1);
       ESP_LOGI(TAG, "Subscribe to /board/led successful, msg_id=%d", msg_id);
 
-      msg_id = esp_mqtt_client_publish(global_mqtt_client, "/board/button", tmp36_temp_str, 0, 1, 0);
-      ESP_LOGI(TAG, "Publish to /board/button successful, msg_id=%d, temp in celsius", msg_id);
+      add_device_name_to_msg(data, tmp36_temp_str);
+      msg_id = esp_mqtt_client_publish(client, "/board/temp", data, 0, 1, 0);
+      ESP_LOGI(TAG, "Publish to /board/temp successful, msg_id=%d, temp in celsius", msg_id);
       xEventGroupSetBits(mqtt_event_group, MQTT_HEALTH_BIT);
       break;
     case MQTT_EVENT_DISCONNECTED:
@@ -237,7 +242,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 static void mqtt_start(void)
 {
   char lwt_data[MAX_MSG_LEN];
-  add_device_name_to_msg(lwt_data, "Offline");
+  add_device_name_to_msg(lwt_data, "MQTT timeout/disconnect");
   esp_mqtt_client_config_t mqtt_cfg = {
     .uri = CONFIG_BROKER_URL,
     .event_handle = mqtt_event_handler,
@@ -328,7 +333,10 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
 
 static void button_to_mqtt_task(void* arg)
 {
-  // FIXME declaring + initializing too many variables
+  // FIXME: declaring + initializing too many variables.
+  // TODO: Currently device is on for too short a period for button task to
+  //        work properly, so create timer that resets on each button press and
+  //        deep sleeps at timer's end.
   uint32_t io_num, button_level;
   int msg_id;
   char data[MAX_MSG_LEN];
@@ -345,6 +353,9 @@ static void button_to_mqtt_task(void* arg)
 
 static void button_init(void)
 {
+  // deinit button as rtc gpio, as waking from deep sleep leaves it in rtc mode
+  // and it doesn't function properly
+  rtc_gpio_deinit(BUTTON_GPIO_INPUT_IO_0);
   // config struct
   gpio_config_t io_conf;
   // interrupt of falling edge
@@ -376,6 +387,38 @@ static void isr_init(void)
 
 void app_main(void)
 {
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  int sleep_time_ms = (now.tv_sec - sleep_enter_time.tv_sec) * 1000 + (now.tv_usec - sleep_enter_time.tv_usec) / 1000;
+
+  // TODO: incorporate this into the switch case below.
+  // wakeup source flag
+  // 0 => timer; 1 => gpio
+  int source = 0;
+  // wakeup info char array
+  char wakeup_data[MAX_MSG_LEN];
+
+  switch (esp_sleep_get_wakeup_cause()) {
+    case ESP_SLEEP_WAKEUP_EXT1: {
+      source = 1;
+      uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+      if (wakeup_pin_mask != 0) {
+        int pin = __builtin_ffsll(wakeup_pin_mask) - 1;
+        printf("Wake up from GPIO %d\n", pin);
+      } else {
+        printf("Wake up from GPIO\n");
+      }
+      break;
+    }
+    case ESP_SLEEP_WAKEUP_TIMER: {
+      ESP_LOGI(TAG, "Wake up from timer. Time spent in deep sleep: %dms\n", sleep_time_ms);
+      break;
+    }
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    default:
+      ESP_LOGI(TAG, "Not a deep sleep reset\n");
+  }
+
   ESP_LOGI(TAG, "[APP] Startup..");
   ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
   ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
@@ -401,12 +444,27 @@ void app_main(void)
   printf("raw voltage in app_main(): %dmV\n", tmp36_voltage);
   uint32_t tmp36_temp = (tmp36_voltage - 500)/10;
   printf("raw temp in app_main(): %d celsius\n", tmp36_temp);
-  sprintf(tmp36_temp_str, "temp => %d", tmp36_temp);
+  sprintf(tmp36_temp_str, "Temp: %d Celsius", tmp36_temp);
 
   if( wifi_init() )
   {
     isr_init();
     mqtt_start();
+
+    // TODO: clean this up, maybe move this logic to switch statement above or
+    // better yet mqtt event handler
+    // TODO: include length of sleep time, also time of day
+    int wakeup_msg_id;
+    if (source == 1){
+      add_device_name_to_msg(wakeup_data, "Wakeup from sleep. Source: GPIO");
+      wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 2, 1);
+      ESP_LOGI(TAG, "Publish to /monitor/status successful, wakeup status, msg_id=%d", wakeup_msg_id);
+    } else {
+      add_device_name_to_msg(wakeup_data, "Wakeup from sleep. Source: Timer");
+      wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 2, 1);
+      ESP_LOGI(TAG, "Publish to /monitor/status successful, wakeup status, msg_id=%d", wakeup_msg_id);
+    }
+
     esp_mqtt_client_stop(global_mqtt_client);
   } else
   {
@@ -416,21 +474,12 @@ void app_main(void)
   ESP_ERROR_CHECK(esp_wifi_stop());
   ESP_LOGI(TAG, "Stopping wifi");
 
-  struct timeval now;
-  gettimeofday(&now, NULL);
-  int sleep_time_ms = (now.tv_sec - sleep_enter_time.tv_sec) * 1000 + (now.tv_usec - sleep_enter_time.tv_usec) / 1000;
-
-  switch (esp_sleep_get_wakeup_cause()) {
-    case ESP_SLEEP_WAKEUP_TIMER: {
-      ESP_LOGI(TAG, "Wake up from timer. Time spent in deep sleep: %dms\n", sleep_time_ms);
-      break;
-    }
-    case ESP_SLEEP_WAKEUP_UNDEFINED:
-    default:
-      ESP_LOGI(TAG, "Not a deep sleep reset\n");
-  }
+  // TODO: is it possible to debounce button press?
+  printf("Enabling EXT1 wakeup on pin GPIO%d\n", BUTTON_GPIO_INPUT_IO_0);
+  esp_sleep_enable_ext1_wakeup(GPIO_INPUT_PIN_SEL, ESP_EXT1_WAKEUP_ANY_HIGH);
 
   printf("Entering deep sleep\n");
   gettimeofday(&sleep_enter_time, NULL);
+  // TODO: Allow sleep time to be sent via mqtt
   esp_deep_sleep(60000000);   // deep sleep for 60 seconds
 }
