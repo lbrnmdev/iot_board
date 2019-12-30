@@ -442,9 +442,9 @@ void app_main(void)
   printf("raw adc in app_main(): %d\n", tmp36_reading);
   uint32_t tmp36_voltage = esp_adc_cal_raw_to_voltage(tmp36_reading, adc_chars);
   printf("raw voltage in app_main(): %dmV\n", tmp36_voltage);
-  uint32_t tmp36_temp = (tmp36_voltage - 500)/10;
-  printf("raw temp in app_main(): %d celsius\n", tmp36_temp);
-  sprintf(tmp36_temp_str, "Temp: %d Celsius", tmp36_temp);
+  float tmp36_temp = (tmp36_voltage - 500)/((float)10);
+  printf("raw temp in app_main(): %f celsius\n", tmp36_temp);
+  sprintf(tmp36_temp_str, "%.1f", tmp36_temp);
 
   if( wifi_init() )
   {
