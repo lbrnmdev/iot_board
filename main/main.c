@@ -197,7 +197,8 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
     case MQTT_EVENT_CONNECTED:
       ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
       add_device_name_to_msg(data, "Online"); // TODO: wakeup source data
-      msg_id = esp_mqtt_client_publish(client, "/monitor/status", data, 0, 2, 1);
+      // msg_id = esp_mqtt_client_publish(client, "/monitor/status", data, 0, 2, 1); // ruby mqtt client doesn't support qos 2
+      msg_id = esp_mqtt_client_publish(client, "/monitor/status", data, 0, 1, 0);
       ESP_LOGI(TAG, "Publish to /monitor/status successful, msg_id=%d", msg_id);
 
       msg_id = esp_mqtt_client_subscribe(client, "/board/led", 1);
