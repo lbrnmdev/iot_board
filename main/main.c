@@ -458,13 +458,19 @@ void app_main(void)
     int wakeup_msg_id;
     if (source == 1){
       add_device_name_to_msg(wakeup_data, "Wakeup from sleep. Source: GPIO");
-      wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 2, 1);
+      // wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 2, 1); //incompatible with ruby client
+      wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 1, 0);
       ESP_LOGI(TAG, "Publish to /monitor/status successful, wakeup status, msg_id=%d", wakeup_msg_id);
     } else {
       add_device_name_to_msg(wakeup_data, "Wakeup from sleep. Source: Timer");
-      wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 2, 1);
+      // wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 2, 1); //incompatible with ruby client
+      wakeup_msg_id = esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 1, 0);
       ESP_LOGI(TAG, "Publish to /monitor/status successful, wakeup status, msg_id=%d", wakeup_msg_id);
     }
+
+    // publishing 'sleep' as status to mqtt. however device doesn't actually sleep till below
+    add_device_name_to_msg(wakeup_data, "Deep sleep");
+    esp_mqtt_client_publish(global_mqtt_client, "/monitor/status", wakeup_data, 0, 1, 0);
 
     esp_mqtt_client_stop(global_mqtt_client);
   } else
